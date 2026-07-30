@@ -149,30 +149,37 @@ func enrich(client *Client, cfg Config, node *Node) bool {
 		return false
 	}
 
-	for _, proc := range info.ProcessInfo.ForegroundProcesses {
-		argv := proc.Argv
-		if len(argv) == 0 {
-			continue
-		}
-		// An idle pane's foreground process is its shell; that means "nothing
-		// running", not "restore a shell".
-		if IsShell(argv[0]) || IsShell(proc.Name) {
-			continue
-		}
-		if cfg.Denied(argv) {
-			continue
-		}
-		node.Command = argv
-		if proc.Cwd != "" {
-			node.Cwd = proc.Cwd
-		}
-		// Panes are recreated on restore, so a stale id would be meaningless.
-		node.PaneID = ""
-		return true
+	// Panes are recreated on restore, so a stale id would be meaningless.
+	node.PaneID = ""
+
+	procs := info.ProcessInfo.ForegroundProcesses
+	if len(procs) == 0 {
+		return false
 	}
 
-	node.PaneID = ""
-	return false
+	// Only the first entry is the pane's own command. The rest are its
+	// children, and walking into them restores the wrong thing entirely: a
+	// denied `claude` pane would otherwise come back as whatever MCP server it
+	// happened to have spawned.
+	proc := procs[0]
+	if len(proc.Argv) == 0 {
+		return false
+	}
+
+	// An idle pane's foreground process is its shell; that means "nothing
+	// running", not "restore a shell".
+	if IsShell(proc.Argv[0]) || IsShell(proc.Name) {
+		return false
+	}
+	if cfg.Denied(proc.Argv) {
+		return false
+	}
+
+	node.Command = proc.Argv
+	if proc.Cwd != "" {
+		node.Cwd = proc.Cwd
+	}
+	return true
 }
 
 // ── restore ─────────────────────────────────────────────────────
