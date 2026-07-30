@@ -1,0 +1,30 @@
+id = "resurrect"
+name = "resurrect"
+version = "0.1.0"
+min_herdr_version = "0.7.5"
+description = "Bring back what was actually running in your panes after a herdr server restart"
+platforms = ["linux", "macos"]
+
+# Downloads the prebuilt binary for this platform from the GitHub release, so
+# installing needs nothing but curl and tar. Falls back to `go build` only when
+# no matching asset exists.
+[[build]]
+command = ["sh", "scripts/fetch-binary.sh"]
+
+# Runs once after herdr has restored the session and its socket is ready:
+# replays the last capture, then leaves a detached daemon behind to keep
+# capturing. Exits immediately so herdr's startup is never held open.
+[[startup]]
+command = ["bin/herdr-resurrect", "boot"]
+
+[[actions]]
+id = "save"
+title = "Save running commands"
+contexts = ["workspace"]
+command = ["bin/herdr-resurrect", "save"]
+
+[[actions]]
+id = "restore"
+title = "Restore running commands"
+contexts = ["workspace"]
+command = ["bin/herdr-resurrect", "restore"]
