@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -65,12 +66,41 @@ type tabInfo struct {
 
 type processInfo struct {
 	ProcessInfo struct {
+		ShellPID            int `json:"shell_pid"`
 		ForegroundProcesses []struct {
 			Argv []string `json:"argv"`
 			Name string   `json:"name"`
 			Cwd  string   `json:"cwd"`
 		} `json:"foreground_processes"`
 	} `json:"process_info"`
+}
+
+// resolveShell turns herdr's shell_pid into a stable path to that shell.
+//
+// `ps -o comm=` reports argv[0], which for a login shell is "-fish". lsof would
+// give the real executable, but on Homebrew that is the versioned Cellar path,
+// which stops existing at the next upgrade. So take the name and look it up on
+// PATH to get the stable symlink instead.
+func resolveShell(pid int) string {
+	if pid <= 0 {
+		return ""
+	}
+	out, err := exec.Command("ps", "-o", "comm=", "-p", fmt.Sprint(pid)).Output()
+	if err != nil {
+		return ""
+	}
+	name := strings.TrimPrefix(strings.TrimSpace(string(out)), "-")
+	if name == "" || !IsShell(name) {
+		return ""
+	}
+	if filepath.IsAbs(name) {
+		return name
+	}
+	path, err := exec.LookPath(filepath.Base(name))
+	if err != nil {
+		return ""
+	}
+	return path
 }
 
 func save() error {
@@ -161,6 +191,16 @@ func enrich(client *Client, cfg Config, node *Node) bool {
 	// children, and walking into them restores the wrong thing entirely: a
 	// denied `claude` pane would otherwise come back as whatever MCP server it
 	// happened to have spawned.
+	// The deny list has to be checked against every foreground process, not just
+	// the pane's own. An agent puts its children in the foreground too, so
+	// procs[0] is frequently `node .../tmux-mcp` or `caffeinate` rather than
+	// `claude` — and then a denied pane comes back as whatever it had spawned.
+	for _, p := range procs {
+		if len(p.Argv) > 0 && cfg.Denied(p.Argv) {
+			return false
+		}
+	}
+
 	proc := procs[0]
 	if len(proc.Argv) == 0 {
 		return false
@@ -177,6 +217,7 @@ func enrich(client *Client, cfg Config, node *Node) bool {
 	}
 
 	node.Command = proc.Argv
+	node.Shell = resolveShell(info.ProcessInfo.ShellPID)
 	if proc.Cwd != "" {
 		node.Cwd = proc.Cwd
 	}
@@ -195,9 +236,15 @@ func restore() error {
 	}
 
 	client := NewClient()
+	cfg := LoadConfig()
 	var failures []string
 
 	for _, tab := range snapshot.Tabs {
+		// Wrapping happens here rather than in save() so the snapshot stays a
+		// faithful record of what was running, and so snapshots taken before
+		// this existed still restore correctly.
+		wrapTree(tab.Root, cfg)
+
 		// layout.apply takes tab_id OR workspace_id, never both. With tab_id it
 		// replaces that tab in place (the tab keeps its label but is assigned a
 		// fresh id); with workspace_id it appends a new tab. Prefer replacing,
@@ -225,6 +272,32 @@ func restore() error {
 		return fmt.Errorf("restored with errors:\n  %s", strings.Join(failures, "\n  "))
 	}
 	return nil
+}
+
+// wrapTree rewrites every pane command in the tree so the pane keeps a shell
+// underneath it.
+func wrapTree(node *Node, cfg Config) {
+	if node == nil {
+		return
+	}
+	if node.Type == "split" {
+		wrapTree(node.First, cfg)
+		wrapTree(node.Second, cfg)
+		return
+	}
+
+	shell := node.Shell
+	// Always cleared: `shell` is our field, not part of herdr's LayoutNode, and
+	// layout.apply gets this node verbatim.
+	node.Shell = ""
+
+	if !cfg.KeepShell || len(node.Command) == 0 {
+		return
+	}
+	if shell == "" {
+		shell = cfg.ShellPath()
+	}
+	node.Command = WrapCommand(node.Command, shell)
 }
 
 // ── daemon ──────────────────────────────────────────────────────
