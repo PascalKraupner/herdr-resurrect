@@ -67,6 +67,32 @@ func IsShell(name string) bool {
 	return slices.Contains(shells, strings.TrimPrefix(filepath.Base(name), "-"))
 }
 
+// IsIdleShell distinguishes "this pane is sitting at a prompt" from "this pane
+// is running a command that happens to be a shell script".
+//
+// Checking argv[0] alone is not enough, and getting this wrong silently drops
+// work: `./vendor/bin/sail artisan horizon` is exec'd as
+// `sh ./vendor/bin/sail artisan horizon`, so a bare IsShell(argv[0]) threw away
+// every sail, just, npm-wrapper and similar long-running process. A shell only
+// means "idle" when it was given nothing to do, so anything left after the
+// leading flags makes this a real command worth restoring.
+func IsIdleShell(argv []string, name string) bool {
+	if len(argv) == 0 {
+		return IsShell(name)
+	}
+	if !IsShell(argv[0]) && !IsShell(name) {
+		return false
+	}
+	for _, arg := range argv[1:] {
+		// A flag on its own (-l, -i, --login) still leaves the shell idle.
+		// Anything else is a script path or the argument to -c.
+		if !strings.HasPrefix(arg, "-") {
+			return false
+		}
+	}
+	return true
+}
+
 func (c Config) Denied(argv []string) bool {
 	if len(argv) == 0 {
 		return true

@@ -167,8 +167,9 @@ func enrich(client *Client, cfg Config, node *Node) bool {
 	}
 
 	// An idle pane's foreground process is its shell; that means "nothing
-	// running", not "restore a shell".
-	if IsShell(proc.Argv[0]) || IsShell(proc.Name) {
+	// running", not "restore a shell". A shell with a script operand is a real
+	// command, though, which is how `sail`/`just` wrappers reach us.
+	if IsIdleShell(proc.Argv, proc.Name) {
 		return false
 	}
 	if cfg.Denied(proc.Argv) {
