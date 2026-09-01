@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"testing"
+)
 
 // The case that shipped broken: `./vendor/bin/sail artisan horizon` is exec'd as
 // `sh ./vendor/bin/sail artisan horizon`, so checking argv[0] alone classified
@@ -151,5 +155,96 @@ func TestWrapTreeUsesPaneShellAndStripsIt(t *testing.T) {
 	wrapTree(n, cfg)
 	if len(n.Command) != 1 || n.Command[0] != "htop" || n.Shell != "" {
 		t.Errorf("keep_shell=false = %q shell=%q", n.Command, n.Shell)
+	}
+}
+
+// The disaster this guards against: restore fails after a reboot, then the
+// daemon's first capture of the near-empty session overwrites the only record
+// of everything that was running.
+func TestSaveSnapshotKeepsGenerationOnBigShrink(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+
+	tabs := func(n int) []Tab {
+		out := make([]Tab, n)
+		for i := range out {
+			out[i] = Tab{WorkspaceID: "w2", TabID: "w2:t1", Root: &Node{Type: "pane", Cwd: "/tmp"}}
+		}
+		return out
+	}
+	load := func(path string) Snapshot {
+		t.Helper()
+		var s Snapshot
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if err := json.Unmarshal(data, &s); err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		return s
+	}
+
+	if err := SaveSnapshot(Snapshot{Version: 1, Tabs: tabs(8)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(prevSnapshotPath()); !os.IsNotExist(err) {
+		t.Fatal("no generation should exist after the first save")
+	}
+
+	// Losing 8 → 1 keeps the 8-tab snapshot as the previous generation.
+	if err := SaveSnapshot(Snapshot{Version: 1, Tabs: tabs(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(load(prevSnapshotPath()).Tabs); got != 8 {
+		t.Fatalf("previous generation has %d tabs, want 8", got)
+	}
+	if got := len(load(snapshotPath()).Tabs); got != 1 {
+		t.Fatalf("current snapshot has %d tabs, want 1", got)
+	}
+
+	// A same-size capture must not churn the generation away.
+	if err := SaveSnapshot(Snapshot{Version: 1, Tabs: tabs(1)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(load(prevSnapshotPath()).Tabs); got != 8 {
+		t.Fatalf("generation churned to %d tabs, want 8", got)
+	}
+
+	// Ordinary closing of one tab among many does not rotate either.
+	if err := SaveSnapshot(Snapshot{Version: 1, Tabs: tabs(8)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveSnapshot(Snapshot{Version: 1, Tabs: tabs(7)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(load(snapshotPath()).Tabs); got != 7 {
+		t.Fatalf("current snapshot has %d tabs, want 7", got)
+	}
+	if got := len(load(prevSnapshotPath()).Tabs); got != 8 {
+		t.Fatalf("generation should still hold 8 tabs, got %d", got)
+	}
+}
+
+func TestTreeHasCommandsAndFirstCwd(t *testing.T) {
+	tree := &Node{
+		Type:  "split",
+		First: &Node{Type: "pane", Cwd: "/a"},
+		Second: &Node{
+			Type:   "split",
+			First:  &Node{Type: "pane"},
+			Second: &Node{Type: "pane", Cwd: "/b", Command: []string{"just", "dev"}},
+		},
+	}
+	if !treeHasCommands(tree) {
+		t.Fatal("tree with a command reported none")
+	}
+	if treeHasCommands(&Node{Type: "pane", Cwd: "/a"}) {
+		t.Fatal("idle pane reported a command")
+	}
+	if got := firstCwd(tree); got != "/a" {
+		t.Fatalf("firstCwd = %q, want /a", got)
+	}
+	if got := firstCwd(&Node{Type: "split", First: &Node{Type: "pane"}, Second: &Node{Type: "pane", Cwd: "/b"}}); got != "/b" {
+		t.Fatalf("firstCwd = %q, want /b", got)
 	}
 }

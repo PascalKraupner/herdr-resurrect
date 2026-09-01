@@ -7,6 +7,12 @@
 // Declarative layout tools cover commands you wrote down in advance; this
 // covers the ones you typed by hand.
 //
+// herdr's own restore is also not guaranteed: an OS shutdown SIGHUPs every
+// pane before the server exits, which herdr reads as the user closing
+// everything and clears its session file. The snapshot therefore keeps every
+// tab with its cwds, not just the ones with commands, and restore recreates
+// any workspace herdr failed to bring back.
+//
 //	herdr-resurrect save      capture what is running now
 //	herdr-resurrect restore   replay the last capture
 //	herdr-resurrect daemon    capture on an interval
@@ -137,12 +143,11 @@ func save() error {
 				continue
 			}
 
+			// All-idle tabs stay in the snapshot too. herdr normally restores
+			// their shape itself, and restore() skips them then, but when
+			// herdr's session file was cleared they are the only record left.
 			root := export.Layout.Root
-			if !enrich(client, cfg, root) {
-				// Every pane in this tab was idle, so there is nothing worth
-				// restoring beyond the shape herdr already restores itself.
-				continue
-			}
+			enrich(client, cfg, root)
 
 			snapshot.Tabs = append(snapshot.Tabs, Tab{
 				WorkspaceID:    ws.WorkspaceID,
@@ -157,34 +162,43 @@ func save() error {
 	return SaveSnapshot(snapshot)
 }
 
-// enrich walks the layout tree and attaches each pane's running command.
-// Returns true if any pane in the tree had one worth restoring.
-func enrich(client *Client, cfg Config, node *Node) bool {
+// enrich walks the layout tree, records each pane's cwd, and attaches its
+// running command when there is one worth restoring.
+func enrich(client *Client, cfg Config, node *Node) {
 	if node == nil {
-		return false
+		return
 	}
 
 	if node.Type == "split" {
-		first := enrich(client, cfg, node.First)
-		second := enrich(client, cfg, node.Second)
-		return first || second
+		enrich(client, cfg, node.First)
+		enrich(client, cfg, node.Second)
+		return
 	}
 
 	if node.PaneID == "" {
-		return false
+		return
 	}
 
 	var info processInfo
-	if err := client.Call("pane.process_info", map[string]any{"pane_id": node.PaneID}, &info); err != nil {
-		return false
-	}
+	err := client.Call("pane.process_info", map[string]any{"pane_id": node.PaneID}, &info)
 
 	// Panes are recreated on restore, so a stale id would be meaningless.
 	node.PaneID = ""
 
+	if err != nil {
+		return
+	}
+
 	procs := info.ProcessInfo.ForegroundProcesses
 	if len(procs) == 0 {
-		return false
+		return
+	}
+
+	// The cwd is recorded even for idle and denied panes: when restore has to
+	// recreate a whole workspace, a bare shell in the right directory is what
+	// stands in for the pane herdr could not bring back.
+	if procs[0].Cwd != "" {
+		node.Cwd = procs[0].Cwd
 	}
 
 	// Only the first entry is the pane's own command. The rest are its
@@ -197,31 +211,27 @@ func enrich(client *Client, cfg Config, node *Node) bool {
 	// `claude` — and then a denied pane comes back as whatever it had spawned.
 	for _, p := range procs {
 		if len(p.Argv) > 0 && cfg.Denied(p.Argv) {
-			return false
+			return
 		}
 	}
 
 	proc := procs[0]
 	if len(proc.Argv) == 0 {
-		return false
+		return
 	}
 
 	// An idle pane's foreground process is its shell; that means "nothing
 	// running", not "restore a shell". A shell with a script operand is a real
 	// command, though, which is how `sail`/`just` wrappers reach us.
 	if IsIdleShell(proc.Argv, proc.Name) {
-		return false
+		return
 	}
 	if cfg.Denied(proc.Argv) {
-		return false
+		return
 	}
 
 	node.Command = proc.Argv
 	node.Shell = resolveShell(info.ProcessInfo.ShellPID)
-	if proc.Cwd != "" {
-		node.Cwd = proc.Cwd
-	}
-	return true
 }
 
 // ── restore ─────────────────────────────────────────────────────
@@ -237,7 +247,31 @@ func restore() error {
 
 	client := NewClient()
 	cfg := LoadConfig()
+
+	// Which workspaces herdr itself brought back. When its session file
+	// survived, all of them; when an OS shutdown cleared it, only the bare
+	// startup workspace, and everything else has to be rebuilt from here.
+	var wsList struct {
+		Workspaces []workspaceInfo `json:"workspaces"`
+	}
+	if err := client.Call("workspace.list", nil, &wsList); err != nil {
+		return err
+	}
+	existing := make(map[string]bool, len(wsList.Workspaces))
+	for _, ws := range wsList.Workspaces {
+		existing[ws.WorkspaceID] = true
+	}
+
+	// Workspaces recreated during this restore, old id → new id, and the
+	// fresh initial tab each one came with, which the first restored tab
+	// replaces so recreation does not leave an empty tab behind.
+	created := map[string]string{}
+	initialTab := map[string]string{}
+
 	var failures []string
+	fail := func(tab Tab, err error) {
+		failures = append(failures, fmt.Sprintf("%s: %v", tab.TabID, err))
+	}
 
 	for _, tab := range snapshot.Tabs {
 		// Wrapping happens here rather than in save() so the snapshot stays a
@@ -245,26 +279,70 @@ func restore() error {
 		// this existed still restore correctly.
 		wrapTree(tab.Root, cfg)
 
-		// layout.apply takes tab_id OR workspace_id, never both. With tab_id it
-		// replaces that tab in place (the tab keeps its label but is assigned a
-		// fresh id); with workspace_id it appends a new tab. Prefer replacing,
-		// so a restore does not duplicate the tabs herdr already brought back,
-		// and fall back to appending if that tab no longer exists.
 		params := map[string]any{"root": tab.Root}
 		if tab.TabLabel != "" {
 			params["tab_label"] = tab.TabLabel
 		}
 
-		params["tab_id"] = tab.TabID
-		err := client.Call("layout.apply", params, nil)
-		if err == nil {
+		if existing[tab.WorkspaceID] {
+			// herdr restored the shape, so an all-idle tab needs nothing.
+			if !treeHasCommands(tab.Root) {
+				continue
+			}
+
+			// layout.apply takes tab_id OR workspace_id, never both. With
+			// tab_id it replaces that tab in place (the tab keeps its label
+			// but is assigned a fresh id); with workspace_id it appends a new
+			// tab. Prefer replacing, so a restore does not duplicate the tabs
+			// herdr already brought back, and fall back to appending if that
+			// tab no longer exists.
+			params["tab_id"] = tab.TabID
+			if client.Call("layout.apply", params, nil) == nil {
+				continue
+			}
+			delete(params, "tab_id")
+			params["workspace_id"] = tab.WorkspaceID
+			if err := client.Call("layout.apply", params, nil); err != nil {
+				fail(tab, err)
+			}
 			continue
 		}
 
-		delete(params, "tab_id")
-		params["workspace_id"] = tab.WorkspaceID
+		newWS := created[tab.WorkspaceID]
+		if newWS == "" {
+			var res struct {
+				Workspace struct {
+					WorkspaceID string `json:"workspace_id"`
+					ActiveTabID string `json:"active_tab_id"`
+				} `json:"workspace"`
+			}
+			createParams := map[string]any{"focus": false}
+			if cwd := firstCwd(tab.Root); cwd != "" {
+				createParams["cwd"] = cwd
+			}
+			if tab.WorkspaceLabel != "" {
+				createParams["label"] = tab.WorkspaceLabel
+			}
+			if err := client.Call("workspace.create", createParams, &res); err != nil {
+				fail(tab, err)
+				continue
+			}
+			newWS = res.Workspace.WorkspaceID
+			created[tab.WorkspaceID] = newWS
+			initialTab[tab.WorkspaceID] = res.Workspace.ActiveTabID
+		}
+
+		if tid := initialTab[tab.WorkspaceID]; tid != "" {
+			delete(initialTab, tab.WorkspaceID)
+			params["tab_id"] = tid
+			if client.Call("layout.apply", params, nil) == nil {
+				continue
+			}
+			delete(params, "tab_id")
+		}
+		params["workspace_id"] = newWS
 		if err := client.Call("layout.apply", params, nil); err != nil {
-			failures = append(failures, fmt.Sprintf("%s: %v", tab.TabID, err))
+			fail(tab, err)
 		}
 	}
 
@@ -272,6 +350,33 @@ func restore() error {
 		return fmt.Errorf("restored with errors:\n  %s", strings.Join(failures, "\n  "))
 	}
 	return nil
+}
+
+// treeHasCommands reports whether any pane in the tree carries a command,
+// which is what decides if a tab herdr already restored needs replacing.
+func treeHasCommands(node *Node) bool {
+	if node == nil {
+		return false
+	}
+	if node.Type == "split" {
+		return treeHasCommands(node.First) || treeHasCommands(node.Second)
+	}
+	return len(node.Command) > 0
+}
+
+// firstCwd finds the first recorded cwd in the tree, used as the directory a
+// recreated workspace identifies with.
+func firstCwd(node *Node) string {
+	if node == nil {
+		return ""
+	}
+	if node.Type == "split" {
+		if cwd := firstCwd(node.First); cwd != "" {
+			return cwd
+		}
+		return firstCwd(node.Second)
+	}
+	return node.Cwd
 }
 
 // wrapTree rewrites every pane command in the tree so the pane keeps a shell
@@ -321,8 +426,14 @@ func daemon() error {
 // detached daemon behind. It must exit promptly so herdr's startup is not held
 // open.
 func boot() error {
+	// The startup hook's stderr is lost, so a failed restore also leaves a
+	// note in the state dir where it can actually be found.
+	errLog := filepath.Join(stateDir(), "last-restore-error.log")
 	if err := restore(); err != nil {
 		fmt.Fprintf(os.Stderr, "herdr-resurrect: restore: %v\n", err)
+		_ = os.WriteFile(errLog, []byte(time.Now().Format(time.RFC3339)+" "+err.Error()+"\n"), 0o644)
+	} else {
+		_ = os.Remove(errLog)
 	}
 
 	self, err := os.Executable()
@@ -352,6 +463,9 @@ func status() error {
 
 	if len(snapshot.Tabs) == 0 {
 		fmt.Println("snapshot is empty: nothing was running")
+		if _, err := os.Stat(prevSnapshotPath()); err == nil {
+			fmt.Printf("a previous generation is kept at %s\n", prevSnapshotPath())
+		}
 		return nil
 	}
 

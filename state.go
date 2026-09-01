@@ -187,7 +187,8 @@ func LoadConfig() Config {
 	return cfg
 }
 
-func snapshotPath() string { return filepath.Join(stateDir(), "snapshot.json") }
+func snapshotPath() string     { return filepath.Join(stateDir(), "snapshot.json") }
+func prevSnapshotPath() string { return filepath.Join(stateDir(), "snapshot.prev.json") }
 
 func SaveSnapshot(s Snapshot) error {
 	if err := os.MkdirAll(stateDir(), 0o755); err != nil {
@@ -197,6 +198,15 @@ func SaveSnapshot(s Snapshot) error {
 	if err != nil {
 		return err
 	}
+
+	// A capture that lost more than half the tabs is kept as a generation
+	// before being replaced. The case that destroyed real data: after a boot
+	// where restore failed, the daemon's first capture of the near-empty
+	// session overwrote the only record of everything that had been running.
+	if cur, err := LoadSnapshot(); err == nil && len(cur.Tabs) > 0 && len(s.Tabs)*2 < len(cur.Tabs) {
+		_ = os.Rename(snapshotPath(), prevSnapshotPath())
+	}
+
 	// Write and rename so a crash mid-save cannot leave a truncated snapshot
 	// that would then restore a broken layout.
 	tmp := snapshotPath() + ".tmp"
