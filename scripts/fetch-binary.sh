@@ -5,6 +5,7 @@
 # herdr-plugin.toml, so installing needs only curl and tar. Falls back to
 # building from source when no asset matches, which needs Go.
 set -eu
+umask 022
 
 REPO="PascalKraupner/herdr-resurrect"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)"
@@ -25,9 +26,20 @@ mkdir -p bin
 asset="herdr-resurrect_${os}_${arch}.tar.gz"
 url="https://github.com/$REPO/releases/download/v$VERSION/$asset"
 
-if command -v curl >/dev/null 2>&1 && curl -fsSL "$url" -o "/tmp/$asset" 2>/dev/null; then
-    tar -xzf "/tmp/$asset" -C bin herdr-resurrect
-    rm -f "/tmp/$asset"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+if command -v curl >/dev/null 2>&1 && curl --retry 3 -fsSL "$url" -o "$tmp/$asset"; then
+    curl --retry 3 -fsSL "https://github.com/$REPO/releases/download/v$VERSION/SHA256SUMS" -o "$tmp/SHA256SUMS"
+    expected="$(awk -v asset="$asset" '$2 == asset { print $1 }' "$tmp/SHA256SUMS")"
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual="$(sha256sum "$tmp/$asset" | cut -d ' ' -f 1)"
+    else
+        actual="$(shasum -a 256 "$tmp/$asset" | cut -d ' ' -f 1)"
+    fi
+    [ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "checksum mismatch for $asset" >&2; exit 1; }
+    tar -xzf "$tmp/$asset" -C "$tmp" herdr-resurrect
+    mv "$tmp/herdr-resurrect" bin/herdr-resurrect
     chmod +x bin/herdr-resurrect
     echo "installed prebuilt $asset ($VERSION)"
     exit 0

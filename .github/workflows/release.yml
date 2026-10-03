@@ -1,38 +1,53 @@
-name: release
-
+name: Release
 on:
   push:
     tags: ["v*"]
-
 permissions:
-  contents: write
-
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - { goos: linux,  goarch: amd64 }
-          - { goos: linux,  goarch: arm64 }
-          - { goos: darwin, goarch: amd64 }
-          - { goos: darwin, goarch: arm64 }
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: "1.26" }
-
-      - run: go test ./...
-
-      - name: Build
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Check version and build release archives
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags "-s -w" -o herdr-resurrect .
-          tar -czf "herdr-resurrect_${GOOS}_${GOARCH}.tar.gz" herdr-resurrect
-
-      - uses: softprops/action-gh-release@v2
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-plugin.toml)
+          test "$GITHUB_REF_NAME" = "v$version"
+          mkdir dist
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o dist/herdr-resurrect .
+              tar -czf "dist/herdr-resurrect_${os}_${arch}.tar.gz" -C dist herdr-resurrect -C .. LICENSE
+            done
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          files: herdr-resurrect_*.tar.gz
+          name: release
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/SHA256SUMS --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

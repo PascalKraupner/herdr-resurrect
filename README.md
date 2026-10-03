@@ -1,45 +1,35 @@
 # herdr-resurrect
 
-Brings back what was actually *running* in your [herdr](https://herdr.dev) panes
-after a server restart.
-
-herdr already restores the session **shape** on a cold start: workspaces, tabs,
-panes, layout, focus and each pane's cwd. Supported agents resume their
-conversations. What it does not restore is arbitrary processes, so a pane that
-was running `sail artisan serve` comes back as a bare shell.
-
-Declarative layout tools cover the commands you wrote down in advance. This
-covers the ones you typed by hand.
-
-herdr's own restore is also not guaranteed: an OS shutdown SIGHUPs every pane
-before the server exits, which herdr reads as the user closing everything and
-it clears its session file. The snapshot therefore keeps **every** tab with its
-per-pane cwds, and restore recreates any workspace herdr failed to bring back,
-label, tabs, layout and all. Panes whose command is denied or was idle come
-back as shells in the right directory.
+Bring back the commands running in your [herdr](https://herdr.dev) panes after
+a server restart. Herdr restores workspaces, tabs, splits, directories, and
+supported agent conversations. A server or editor you started by hand normally
+comes back as an empty shell. This plugin records and relaunches those commands.
 
 ## Install
+
+Requires herdr **0.7.5+** (tested with 0.9.3), Git, curl, and tar.
+Linux and macOS are supported on Intel/AMD and ARM64.
 
 ```bash
 herdr plugin install PascalKraupner/herdr-resurrect
 ```
 
-The build step downloads a prebuilt static binary for your platform, so
-installing needs only `curl` and `tar`. It falls back to `go build` if no
-matching release asset exists.
+Installation downloads a prebuilt binary and checks its SHA-256 checksum.
+If no matching release asset is available, it builds with Go 1.26+.
 
-Nothing else to configure. The `[[startup]]` hook restores on boot and starts
-the capture daemon.
+On the next server start, the startup hook restores the last snapshot and starts
+capturing every 60 seconds. Installing into a running server does not run the
+startup hook. Save explicitly before a planned restart to capture recent changes.
 
-## Commands
+## Use
 
 ```bash
-herdr-resurrect status    # what would be restored
-herdr-resurrect save      # capture now
-herdr-resurrect restore   # replay the last capture
+herdr plugin action invoke status --plugin resurrect
+herdr plugin action invoke save --plugin resurrect
+herdr plugin action invoke restore --plugin resurrect
 ```
 
-`save` and `restore` are also exposed as herdr actions, so you can bind them:
+An optional save binding in `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -48,61 +38,67 @@ type = "shell"
 command = "herdr plugin action invoke save --plugin resurrect"
 ```
 
+Run `herdr server reload-config` after adding it.
+
 ## Configuration
 
-Optional, at `$HERDR_PLUGIN_CONFIG_DIR/config.json`:
+Find the config directory with `herdr plugin config-dir resurrect`.
+Create `config.json` there to override these defaults:
 
 ```json
 {
-  "deny": ["ssh", "claude", "codex", "opencode", "pi"],
-  "interval_seconds": 60
+  "deny": ["ssh", "claude", "codex", "opencode", "pi", "caffeinate", "node"],
+  "interval_seconds": 60,
+  "keep_shell": true,
+  "shell": ""
 }
 ```
 
-**`deny`** is a *deny* list, not an allow list. tmux-resurrect needed
-`@resurrect-processes` because its one-level `ps` could not reliably tell what a
-pane was running, so you had to enumerate what was safe to bring back. herdr
-reports real argv through `pane.process_info`, so the default is to restore
-whatever was running and only name the things you do *not* want relaunched.
+- `deny` matches executable basenames. Setting it replaces the default list.
+  Agents are excluded because herdr resumes them itself. `node` and `caffeinate`
+  are excluded as common agent helpers; remove `node` to restore Node servers.
+- `interval_seconds` sets the time between captures.
+- `keep_shell` leaves a shell under a restored command. Quitting an editor then
+  returns to a prompt instead of closing the pane.
+- `shell` overrides the fallback shell. The recorded shell is preferred;
+  otherwise the plugin uses this setting, `$SHELL`, or fish.
 
-The defaults exist for specific reasons: `ssh` would reconnect and may prompt,
-and the coding agents already come back through herdr's own
-`session.resume_agents_on_restore`, so restoring them here would double up.
+An idle shell is saved with its directory but no command. Shell scripts with
+operands are treated as running commands.
 
-A pane sitting at a prompt has its shell as the foreground process, which means
-"nothing running" rather than "restore a shell": its cwd is captured, but no
-command. Commands that already finished are gone by definition, so one-shot
-invocations never come back.
+## What gets restored
 
-## How it works
+The plugin reads `layout.export` and `pane.process_info`, then saves the layout,
+directories, and foreground argv in `$HERDR_PLUGIN_STATE_DIR/snapshot.json`.
+Restore uses `layout.apply` to replace matching tabs and recreates missing
+workspaces. All-idle tabs that herdr already restored are left alone.
 
-| Step | API |
-|---|---|
-| enumerate | `workspace.list`, `tab.list` |
-| capture shape | `layout.export` per tab |
-| capture commands | `pane.process_info` per pane |
-| replay | `layout.apply` with `command` on each pane node |
+This relaunches commands; it does not resume process memory, shell variables,
+unsaved editor buffers, or pipelines. Manual restore replaces matching tabs,
+so use it before starting new work in those tabs.
 
-`layout.export` returns the split tree; each pane node is enriched with the
-argv of its foreground process and the snapshot is written to
-`$HERDR_PLUGIN_STATE_DIR/snapshot.json` (atomically, so a crash mid-save cannot
-leave a truncated layout).
+Writes are atomic. If a capture loses more than half its tabs, the previous
+capture is kept as `snapshot.prev.json`. Startup restore errors are recorded in
+`last-restore-error.log` in the state directory.
 
-On restore, `layout.apply` takes `tab_id` **or** `workspace_id`, never both.
-With `tab_id` it replaces that tab in place, which is what avoids duplicating
-the tabs herdr already brought back; if that tab is gone, it falls back to
-appending a new one in the workspace. When the whole workspace is gone,
-`workspace.create` rebuilds it (label and cwd included), the first restored tab
-replaces its fresh initial tab, and the rest are appended. Tabs herdr already
-restored that carry no commands are skipped entirely.
+Herdr 0.9.3 adds shutdown protection and layout backups, but still does not
+restore arbitrary running commands. This plugin complements those features.
 
-A capture that lost more than half its tabs is kept as
-`snapshot.prev.json` before being replaced, so a capture taken right after a
-failed restore can never destroy the only good record. A restore that fails at
-boot leaves the error in `$HERDR_PLUGIN_STATE_DIR/last-restore-error.log`.
+## Update, remove, and develop
 
-`layout.export` and `layout.apply` have no CLI, so this talks to
-`$HERDR_SOCKET_PATH` directly with newline-delimited JSON.
+Re-run the install command to update. To remove it:
+
+```bash
+herdr plugin uninstall resurrect
+```
+
+For a local checkout:
+
+```bash
+go test ./...
+go build -o bin/herdr-resurrect .
+herdr plugin link .
+```
 
 ## License
 

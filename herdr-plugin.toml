@@ -1,6 +1,6 @@
 id = "resurrect"
 name = "resurrect"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.7.5"
 description = "Bring back what was actually running in your panes after a herdr server restart"
 platforms = ["linux", "macos"]
@@ -16,6 +16,12 @@ command = ["sh", "scripts/fetch-binary.sh"]
 # capturing. Exits immediately so herdr's startup is never held open.
 [[startup]]
 command = ["bin/herdr-resurrect", "boot"]
+
+[[actions]]
+id = "status"
+title = "Show saved commands"
+contexts = ["workspace"]
+command = ["bin/herdr-resurrect", "status"]
 
 [[actions]]
 id = "save"
