@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -17,6 +18,11 @@ type Client struct {
 	path string
 	seq  atomic.Uint64
 }
+
+// errServerGone marks a request that never reached a server, as opposed to one
+// the server answered with an error. The daemon stops on it: the server it was
+// capturing has exited.
+var errServerGone = errors.New("herdr server is not running")
 
 func NewClient() *Client {
 	path := os.Getenv("HERDR_SOCKET_PATH")
@@ -40,7 +46,7 @@ type response struct {
 func (c *Client) Call(method string, params any, out any) error {
 	conn, err := net.Dial("unix", c.path)
 	if err != nil {
-		return fmt.Errorf("herdr socket at %s: %w", c.path, err)
+		return fmt.Errorf("herdr socket at %s: %w: %w", c.path, errServerGone, err)
 	}
 	defer conn.Close()
 

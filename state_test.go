@@ -248,3 +248,51 @@ func TestTreeHasCommandsAndFirstCwd(t *testing.T) {
 		t.Fatalf("firstCwd = %q, want /b", got)
 	}
 }
+
+// The case that brought back workspaces closed weeks earlier: herdr restored
+// its session fine, the snapshot was stale, and restore recreated every
+// captured workspace herdr did not have.
+func TestHerdrRestored(t *testing.T) {
+	cases := []struct {
+		name       string
+		workspaces []workspaceInfo
+		want       bool
+	}{
+		{"cleared session: one fresh workspace", []workspaceInfo{{WorkspaceID: "w1", TabCount: 1}}, false},
+		{"nothing at all", nil, false},
+		{"several workspaces", []workspaceInfo{{WorkspaceID: "w3", TabCount: 1}, {WorkspaceID: "w4", TabCount: 1}}, true},
+		{"one workspace with several tabs", []workspaceInfo{{WorkspaceID: "w3", TabCount: 4}}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := herdrRestored(c.workspaces); got != c.want {
+				t.Errorf("herdrRestored = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// Focus events start a daemon whenever none is running, so a second one must
+// not get the lock while the first holds it, and the lock must free up again.
+func TestDaemonLockIsSingleton(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+
+	if daemonRunning() {
+		t.Fatal("no daemon should be running yet")
+	}
+	first, err := lockDaemon()
+	if err != nil || first == nil {
+		t.Fatalf("first lock: %v, %v", first, err)
+	}
+	if !daemonRunning() {
+		t.Error("daemonRunning = false while the lock is held")
+	}
+	second, err := lockDaemon()
+	if err != nil || second != nil {
+		t.Fatalf("second lock = %v, %v; want nil, nil", second, err)
+	}
+	first.Close()
+	if daemonRunning() {
+		t.Error("daemonRunning = true after the holder released the lock")
+	}
+}

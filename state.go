@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 )
 
 // Node mirrors herdr's LayoutNode. The pane variant carries the command we want
@@ -189,6 +191,40 @@ func LoadConfig() Config {
 
 func snapshotPath() string     { return filepath.Join(stateDir(), "snapshot.json") }
 func prevSnapshotPath() string { return filepath.Join(stateDir(), "snapshot.prev.json") }
+func saveErrorPath() string    { return filepath.Join(stateDir(), "last-save-error.log") }
+func daemonLockPath() string   { return filepath.Join(stateDir(), "daemon.lock") }
+
+// lockDaemon takes the lock that keeps the daemon a singleton, or returns nil
+// when another process holds it. The kernel drops the lock when its holder
+// exits, so a crashed daemon never leaves a stale lock behind.
+func lockDaemon() (*os.File, error) {
+	if err := os.MkdirAll(stateDir(), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(daemonLockPath(), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
+// daemonRunning probes the lock without keeping it. Two callers can both see it
+// free and both start a daemon; the second one then fails to lock and exits.
+func daemonRunning() bool {
+	f, err := lockDaemon()
+	if err != nil || f == nil {
+		return err == nil
+	}
+	f.Close()
+	return false
+}
 
 func SaveSnapshot(s Snapshot) error {
 	if err := os.MkdirAll(stateDir(), 0o755); err != nil {

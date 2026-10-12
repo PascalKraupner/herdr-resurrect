@@ -11,16 +11,18 @@
 // pane before the server exits, which herdr reads as the user closing
 // everything and clears its session file. The snapshot therefore keeps every
 // tab with its cwds, not just the ones with commands, and restore recreates
-// any workspace herdr failed to bring back.
+// the workspaces when herdr lost its session.
 //
 //	herdr-resurrect save      capture what is running now
 //	herdr-resurrect restore   replay the last capture
 //	herdr-resurrect daemon    capture on an interval
 //	herdr-resurrect boot      restore, then start the daemon (used by [[startup]])
-//	herdr-resurrect status    show what would be restored
+//	herdr-resurrect ensure    start the daemon unless one is running (used by [[events]])
+//	herdr-resurrect status    show the daemon and what would be restored
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -45,11 +47,18 @@ func main() {
 		err = daemon()
 	case "boot":
 		err = boot()
+	case "ensure":
+		err = ensureDaemon()
 	case "status":
 		err = status()
 	default:
-		fmt.Fprintln(os.Stderr, "usage: herdr-resurrect <save|restore|daemon|boot|status>")
+		fmt.Fprintln(os.Stderr, "usage: herdr-resurrect <save|restore|daemon|boot|ensure|status>")
 		os.Exit(2)
+	}
+
+	// Any manual action is also a chance to revive a daemon that died.
+	if err == nil && (cmd == "save" || cmd == "restore" || cmd == "status") {
+		err = ensureDaemon()
 	}
 
 	if err != nil {
@@ -63,6 +72,7 @@ func main() {
 type workspaceInfo struct {
 	WorkspaceID string `json:"workspace_id"`
 	Label       string `json:"label"`
+	TabCount    int    `json:"tab_count"`
 }
 
 type tabInfo struct {
@@ -262,6 +272,12 @@ func restore() error {
 		existing[ws.WorkspaceID] = true
 	}
 
+	// When herdr's session survived, a captured workspace it did not bring
+	// back was closed after that capture. Recreating it resurrected
+	// workspaces closed weeks earlier once the daemon had silently stopped
+	// capturing, so only rebuild when herdr lost its session.
+	recreate := !herdrRestored(wsList.Workspaces)
+
 	// Workspaces recreated during this restore, old id → new id, and the
 	// fresh initial tab each one came with, which the first restored tab
 	// replaces so recreation does not leave an empty tab behind.
@@ -305,6 +321,10 @@ func restore() error {
 			if err := client.Call("layout.apply", params, nil); err != nil {
 				fail(tab, err)
 			}
+			continue
+		}
+
+		if !recreate {
 			continue
 		}
 
@@ -364,6 +384,13 @@ func treeHasCommands(node *Node) bool {
 	return len(node.Command) > 0
 }
 
+// herdrRestored reports whether herdr brought its own session back. A session
+// file cleared by an OS shutdown leaves herdr with one fresh workspace holding
+// one tab; anything more is a restored session.
+func herdrRestored(workspaces []workspaceInfo) bool {
+	return len(workspaces) > 1 || (len(workspaces) == 1 && workspaces[0].TabCount > 1)
+}
+
 // firstCwd finds the first recorded cwd in the tree, used as the directory a
 // recreated workspace identifies with.
 func firstCwd(node *Node) string {
@@ -408,15 +435,37 @@ func wrapTree(node *Node, cfg Config) {
 // ── daemon ──────────────────────────────────────────────────────
 
 func daemon() error {
+	lock, err := lockDaemon()
+	if err != nil {
+		return err
+	}
+	if lock == nil {
+		return nil // another daemon is already capturing
+	}
+	defer lock.Close()
+
 	cfg := LoadConfig()
 	ticker := time.NewTicker(time.Duration(cfg.IntervalSeconds) * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := save(); err != nil {
-			// A failed capture must not kill the daemon; the server may simply
-			// be restarting.
+		err := save()
+		// The daemon's stderr is discarded, so a failing capture also leaves a
+		// note in the state dir. Without one, a daemon that could not save
+		// looked exactly like a healthy one.
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "herdr-resurrect: save failed: %v\n", err)
+			_ = os.WriteFile(saveErrorPath(), []byte(time.Now().Format(time.RFC3339)+" "+err.Error()+"\n"), 0o644)
+		} else {
+			_ = os.Remove(saveErrorPath())
+		}
+
+		// The server this daemon was capturing has exited. Capturing again once
+		// the next one is up would race its restore and could overwrite the
+		// snapshot with the bare shells herdr brings back, so that server's
+		// startup hook starts a fresh daemon after restoring instead.
+		if errors.Is(err, errServerGone) {
+			return nil
 		}
 	}
 	return nil
@@ -436,6 +485,19 @@ func boot() error {
 		_ = os.Remove(errLog)
 	}
 
+	return ensureDaemon()
+}
+
+// ensureDaemon starts the daemon unless one is already running.
+//
+// Starting it from boot alone was not enough: a daemon that died between server
+// starts, killed along with the old server in a live handoff for one, was never
+// replaced, and the snapshot silently froze for weeks. Focus events and manual
+// actions call this too, so a dead daemon is back at the next tab switch.
+func ensureDaemon() error {
+	if daemonRunning() {
+		return nil
+	}
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -452,6 +514,19 @@ func boot() error {
 // ── status ──────────────────────────────────────────────────────
 
 func status() error {
+	if daemonRunning() {
+		fmt.Printf("daemon: capturing every %ds\n", LoadConfig().IntervalSeconds)
+	} else {
+		fmt.Println("daemon: not running, starting it")
+	}
+	if info, err := os.Stat(snapshotPath()); err == nil {
+		fmt.Printf("last capture: %s ago\n", time.Since(info.ModTime()).Round(time.Second))
+	}
+	if data, err := os.ReadFile(saveErrorPath()); err == nil {
+		fmt.Printf("last capture failed: %s", data)
+	}
+	fmt.Println()
+
 	snapshot, err := LoadSnapshot()
 	if err != nil {
 		if os.IsNotExist(err) {

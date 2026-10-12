@@ -18,8 +18,10 @@ Installation downloads a prebuilt binary and checks its SHA-256 checksum.
 If no matching release asset is available, it builds with Go 1.26+.
 
 On the next server start, the startup hook restores the last snapshot and starts
-capturing every 60 seconds. Installing into a running server does not run the
-startup hook. Save explicitly before a planned restart to capture recent changes.
+a daemon that captures every 60 seconds. Installing into a running server does
+not run the startup hook; the daemon starts at the next tab or workspace switch
+instead. Tab and workspace switches also restart a daemon that died. Save
+explicitly before a planned restart to capture recent changes.
 
 ## Use
 
@@ -70,8 +72,10 @@ operands are treated as running commands.
 
 The plugin reads `layout.export` and `pane.process_info`, then saves the layout,
 directories, and foreground argv in `$HERDR_PLUGIN_STATE_DIR/snapshot.json`.
-Restore uses `layout.apply` to replace matching tabs and recreates missing
-workspaces. All-idle tabs that herdr already restored are left alone.
+Restore uses `layout.apply` to replace matching tabs. All-idle tabs that herdr
+already restored are left alone. Missing workspaces are recreated only when herdr
+lost its own session and came back with a single bare workspace; otherwise a
+captured workspace that is missing was closed and stays closed.
 
 This relaunches commands; it does not resume process memory, shell variables,
 unsaved editor buffers, or pipelines. Manual restore replaces matching tabs,
@@ -79,7 +83,11 @@ so use it before starting new work in those tabs.
 
 Writes are atomic. If a capture loses more than half its tabs, the previous
 capture is kept as `snapshot.prev.json`. Startup restore errors are recorded in
-`last-restore-error.log` in the state directory.
+`last-restore-error.log` and failed captures in `last-save-error.log`, both in
+the state directory. The `status` action shows whether the daemon is running,
+how old the last capture is, and the last capture error. The daemon exits when
+the herdr server stops; the next server's startup hook starts a new one after
+restoring.
 
 Herdr 0.9.3 adds shutdown protection and layout backups, but still does not
 restore arbitrary running commands. This plugin complements those features.

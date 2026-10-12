@@ -1,6 +1,6 @@
 id = "resurrect"
 name = "resurrect"
-version = "0.3.0"
+version = "0.4.0"
 min_herdr_version = "0.7.5"
 description = "Bring back what was actually running in your panes after a herdr server restart"
 platforms = ["linux", "macos"]
@@ -16,6 +16,17 @@ command = ["sh", "scripts/fetch-binary.sh"]
 # capturing. Exits immediately so herdr's startup is never held open.
 [[startup]]
 command = ["bin/herdr-resurrect", "boot"]
+
+# Starts the daemon again if it died. The startup hook alone left the snapshot
+# frozen once a daemon was lost between server starts. Exits at once while the
+# daemon is alive.
+[[events]]
+on = "tab.focused"
+command = ["bin/herdr-resurrect", "ensure"]
+
+[[events]]
+on = "workspace.focused"
+command = ["bin/herdr-resurrect", "ensure"]
 
 [[actions]]
 id = "status"
